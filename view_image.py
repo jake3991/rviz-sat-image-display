@@ -1,135 +1,191 @@
 import cv2
 import numpy as np
 import struct
+
+import rclpy
+from rclpy.node import Node
 from std_msgs.msg import Header
 from sensor_msgs.msg import PointCloud2, PointField
-from sensor_msgs import point_cloud2
-import rospy
-import tf
+from sensor_msgs_py import point_cloud2
+
+from geometry_msgs.msg import TransformStamped
+import tf2_ros
+
+from scipy.spatial.transform import Rotation as R
+
 import gtsam
 
 from utils import load_config, write_config
 
-#setup the ROS node and publisher 
-rospy.init_node("sat_image_cloud")
-pub = rospy.Publisher("sat_image_cloud", PointCloud2, queue_size=2)
 
-#read the config
-config = load_config("config/config.yaml")
-transform_config = load_config("config/transform.yaml")
+class SatImageCloudNode(Node):
+    def __init__(self):
+        super().__init__('sat_image_cloud')
 
-#read in the sat image
-sat_img = cv2.imread("images/"+config.get("image"))
+        # Publisher
+        self.pub = self.create_publisher(PointCloud2, 'sat_image_cloud', 10)
 
-#show a blank image, this is a trick to read the keyboard
-cv2.imshow("test", np.zeros((100,100)))
+        # TF broadcaster
+        self.br = tf2_ros.TransformBroadcaster(self)
 
-#push the config into some varibles
-lat = config.get('lattitude')
-long = config.get('longitude')
-zoom = config.get('zoom')
-image_size = sat_img.shape[0]
-assert(sat_img.shape[0] == sat_img.shape[1])
-yaw_angle = transform_config.get('yaw')
-delta_x = transform_config.get('x')
-delta_y = transform_config.get('y')
-delta_z = transform_config.get('z')
-flip = transform_config.get('flip')
+        # Load configs
+        self.config = load_config("config/config.yaml")
+        self.transform_config = load_config("config/transform.yaml")
 
-#get the image scale 
-meters_per_pixel = (1/2)*(156543.03392 * np.cos(lat * np.pi / 180.) / (2**zoom) )
+        # Load image
+        self.sat_img = cv2.imread("images/" + self.config.get("image"))
 
-#containers for the point cloud
-points = []
+        # Keyboard trick window
+        cv2.imshow("test", np.zeros((100, 100)))
 
-#loop over the image and convert it to an RGBA point cloud
-for i in range(sat_img.shape[0]):
-    for j in range(sat_img.shape[1]):
-        
-        #parse out and convert the RGB values to RGBA
-        r, g, b = sat_img[i][j]
-        rgb = struct.unpack('I', struct.pack('BBBB', b, g, r, 255))[0]
-        points.append( [(i-sat_img.shape[0]/2) * meters_per_pixel, (j-sat_img.shape[0]/2) * meters_per_pixel, 0., rgb] )
+        # Params
+        self.lat = self.config.get('lattitude')
+        self.long = self.config.get('longitude')
+        self.zoom = self.config.get('zoom')
 
-#define the point cloud fields
-fields = [PointField('x', 0, PointField.FLOAT32, 1),
-          PointField('y', 4, PointField.FLOAT32, 1),
-          PointField('z', 8, PointField.FLOAT32, 1),
-          PointField('rgb', 12, PointField.UINT32, 1),
-          ]
+        #self.image_size = self.sat_img.shape[0]
+        #assert self.sat_img.shape[0] == self.sat_img.shape[1]
 
-#define the header
-header = Header()
-header.frame_id = "sat_frame"
-pc2 = point_cloud2.create_cloud(header, fields, points)
+        self.yaw_angle = self.transform_config.get('yaw')
+        self.delta_x = self.transform_config.get('x')
+        self.delta_y = self.transform_config.get('y')
+        self.delta_z = self.transform_config.get('z')
+        self.flip = self.transform_config.get('flip')
 
-#define the step size for movement
-step_meters = 1.0
-step_degrees = 1.0
+        # Scale (meters per pixel)
+        self.meters_per_pixel = (1/2) * (
+            156543.03392 * np.cos(self.lat * np.pi / 180.) / (2**self.zoom)
+        )
 
-#loop to read the keyboard
-while True:
-    k = cv2.waitKey(1)
+        # Generate point cloud once
+        self.pc2 = self.generate_pointcloud()
 
-    #if esc
-    if k == 27:
-        config = [{"x":delta_x},
-                    {"y":delta_y},
-                    {"z":delta_z},
-                    {"yaw":yaw_angle},
-                    {"flip":flip}]
-        write_config(config,"config/transform.yaml")
-        cv2.destroyAllWindows()
-        break
+        # Control steps
+        self.step_meters = 1.0
+        self.step_degrees = 1.0
 
-    #change step size
-    if k == ord('o'):
-        step_meters += .1
-    if k == ord('l'):
-        step_meters -= .1
+        # Timer loop (~30 Hz)
+        self.timer = self.create_timer(0.03, self.loop)
 
-    if k == ord('q'):
-        yaw_angle -= step_degrees
-    if k == ord('e'):
-        yaw_angle += step_degrees
+    def generate_pointcloud(self):
+        points = []
 
-    #move down
-    if k == ord('s'):  
-        delta_y -= step_meters
+        for i in range(self.sat_img.shape[0]):
+            for j in range(self.sat_img.shape[1]):
+                r, g, b = self.sat_img[i][j]
+                rgb = struct.unpack('I', struct.pack('BBBB', b, g, r, 255))[0]
 
-    #move up
-    if k == ord('w'):
-        delta_y += step_meters
+                points.append([
+                    (i - self.sat_img.shape[0] / 2) * self.meters_per_pixel,
+                    (j - self.sat_img.shape[0] / 2) * self.meters_per_pixel,
+                    0.0,
+                    rgb
+                ])
 
-    #move left
-    if k == ord('a'):
-        delta_x += step_meters
+        fields = [
+            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name='rgb', offset=12, datatype=PointField.UINT32, count=1),
+        ]
 
-    #move right
-    if k == ord('d'):
-        delta_x -= step_meters
+        header = Header()
+        header.frame_id = "sat_frame"
 
-    #lower
-    if k == ord('f'):
-        delta_z -= .1
-    
-    #raise
-    if k == ord('r'):
-        delta_z += .1
+        return point_cloud2.create_cloud(header, fields, points)
 
-    #flip
-    if k == ord('x'):
-        if flip == 0:
-            flip = 180
-        else:
-            flip = 0
+    def loop(self):
+        k = cv2.waitKey(1)
 
-    pose = gtsam.Pose2(delta_x,delta_y,np.radians(yaw_angle))
-    #pose_inv = pose.inverse()
-    br = tf.TransformBroadcaster()
-    br.sendTransform((pose.x(),pose.y(),delta_z),
-                        tf.transformations.quaternion_from_euler(np.radians(flip), 0, pose.theta()),
-                        rospy.Time.now(),
-                        "sat_frame",
-                        "map")
-    pub.publish(pc2)
+        # ESC to exit and save
+        if k == 27:
+            config = [
+                {"x": self.delta_x},
+                {"y": self.delta_y},
+                {"z": self.delta_z},
+                {"yaw": self.yaw_angle},
+                {"flip": self.flip}
+            ]
+            write_config(config, "config/transform.yaml")
+            cv2.destroyAllWindows()
+            rclpy.shutdown()
+            return
+
+        # Step size
+        if k == ord('o'):
+            self.step_meters += 0.1
+        if k == ord('l'):
+            self.step_meters -= 0.1
+
+        # Rotation
+        if k == ord('q'):
+            self.yaw_angle -= self.step_degrees
+        if k == ord('e'):
+            self.yaw_angle += self.step_degrees
+
+        # Translation
+        if k == ord('s'):
+            self.delta_y -= self.step_meters
+        if k == ord('w'):
+            self.delta_y += self.step_meters
+        if k == ord('a'):
+            self.delta_x += self.step_meters
+        if k == ord('d'):
+            self.delta_x -= self.step_meters
+
+        # Z
+        if k == ord('f'):
+            self.delta_z -= 0.1
+        if k == ord('r'):
+            self.delta_z += 0.1
+
+        # Flip
+        if k == ord('x'):
+            self.flip = 180 if self.flip == 0 else 0
+
+        # Pose
+        pose = gtsam.Pose2(
+            self.delta_x,
+            self.delta_y,
+            np.radians(self.yaw_angle)
+        )
+
+        # TF message
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = "map"
+        t.child_frame_id = "sat_frame"
+
+        t.transform.translation.x = pose.x()
+        t.transform.translation.y = pose.y()
+        t.transform.translation.z = self.delta_z
+
+        # Quaternion using scipy
+        roll = np.radians(self.flip)
+        pitch = 0.0
+        yaw = pose.theta()
+
+        q = R.from_euler('xyz', [roll, pitch, yaw]).as_quat()
+
+        t.transform.rotation.x = q[0]
+        t.transform.rotation.y = q[1]
+        t.transform.rotation.z = q[2]
+        t.transform.rotation.w = q[3]
+
+        self.br.sendTransform(t)
+
+        # Publish cloud
+        self.pc2.header.stamp = t.header.stamp
+        self.pub.publish(self.pc2)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SatImageCloudNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
