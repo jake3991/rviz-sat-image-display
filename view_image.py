@@ -4,12 +4,18 @@ import struct
 
 import rclpy
 from rclpy.node import Node
+
 from std_msgs.msg import Header
 from sensor_msgs.msg import PointCloud2, PointField
 from sensor_msgs_py import point_cloud2
 
 from geometry_msgs.msg import TransformStamped
 import tf2_ros
+
+from visualization_msgs.msg import InteractiveMarker
+from visualization_msgs.msg import InteractiveMarkerControl
+from visualization_msgs.msg import Marker
+from interactive_markers import InteractiveMarkerServer
 
 from scipy.spatial.transform import Rotation as R
 
@@ -22,51 +28,60 @@ class SatImageCloudNode(Node):
     def __init__(self):
         super().__init__('sat_image_cloud')
 
+        # -----------------------------
         # Publisher
+        # -----------------------------
         self.pub = self.create_publisher(PointCloud2, 'sat_image_cloud', 10)
 
         # TF broadcaster
         self.br = tf2_ros.TransformBroadcaster(self)
 
-        # Load configs
+        # -----------------------------
+        # Config
+        # -----------------------------
         self.config = load_config("config/config.yaml")
         self.transform_config = load_config("config/transform.yaml")
 
-        # Load image
+        # Image
         self.sat_img = cv2.imread("images/" + self.config.get("image"))
-
-        # Keyboard trick window
         cv2.imshow("test", np.zeros((100, 100)))
 
-        # Params
+        # -----------------------------
+        # Initial state
+        # -----------------------------
         self.lat = self.config.get('lattitude')
         self.long = self.config.get('longitude')
         self.zoom = self.config.get('zoom')
 
-        #self.image_size = self.sat_img.shape[0]
-        #assert self.sat_img.shape[0] == self.sat_img.shape[1]
+        self.image_size = self.sat_img.shape[0]
 
-        self.yaw_angle = self.transform_config.get('yaw')
-        self.delta_x = self.transform_config.get('x')
-        self.delta_y = self.transform_config.get('y')
-        self.delta_z = self.transform_config.get('z')
-        self.flip = self.transform_config.get('flip')
+        self.yaw_angle = float(self.transform_config.get('yaw'))
+        self.delta_x = float(self.transform_config.get('x'))
+        self.delta_y = float(self.transform_config.get('y'))
+        self.delta_z = float(self.transform_config.get('z'))
+        self.flip = float(self.transform_config.get('flip'))
 
-        # Scale (meters per pixel)
-        self.meters_per_pixel = (1/2) * (
-            156543.03392 * np.cos(self.lat * np.pi / 180.) / (2**self.zoom)
+        # scale
+        self.meters_per_pixel = (1 / 2) * (
+            156543.03392 * np.cos(self.lat * np.pi / 180.0) / (2 ** self.zoom)
         )
 
-        # Generate point cloud once
+        # Precompute cloud once
         self.pc2 = self.generate_pointcloud()
 
-        # Control steps
-        self.step_meters = 1.0
-        self.step_degrees = 1.0
+        # -----------------------------
+        # Interactive Marker Server
+        # -----------------------------
+        self.server = InteractiveMarkerServer(self, "sat_marker")
+        self.create_interactive_marker()
+        self.server.applyChanges()
 
-        # Timer loop (~30 Hz)
+        # Timer loop
         self.timer = self.create_timer(0.03, self.loop)
 
+    # =========================================================
+    # Point Cloud Generation
+    # =========================================================
     def generate_pointcloud(self):
         points = []
 
@@ -77,7 +92,7 @@ class SatImageCloudNode(Node):
 
                 points.append([
                     (i - self.sat_img.shape[0] / 2) * self.meters_per_pixel,
-                    (j - self.sat_img.shape[0] / 2) * self.meters_per_pixel,
+                    (j - self.sat_img.shape[1] / 2) * self.meters_per_pixel,
                     0.0,
                     rgb
                 ])
@@ -94,78 +109,141 @@ class SatImageCloudNode(Node):
 
         return point_cloud2.create_cloud(header, fields, points)
 
+    # =========================================================
+    # Interactive Marker
+    # =========================================================
+    def create_interactive_marker(self):
+        im = InteractiveMarker()
+        im.header.frame_id = "map"
+        im.name = "sat_frame_control"
+        im.description = "Satellite Frame"
+        im.scale = 30.0
+
+        im.pose.position.x = self.delta_x
+        im.pose.position.y = self.delta_y
+        im.pose.position.z = self.delta_z
+
+        q = R.from_euler(
+            'xyz',
+            [np.radians(self.flip), 0.0, np.radians(self.yaw_angle)]
+        ).as_quat()
+
+        im.pose.orientation.x = q[0]
+        im.pose.orientation.y = q[1]
+        im.pose.orientation.z = q[2]
+        im.pose.orientation.w = q[3]
+
+        # =====================================================
+        # 1. XY PLANE MOVE (coarse positioning)
+        # =====================================================
+        move_xy = InteractiveMarkerControl()
+        move_xy.name = "move_xy"
+        move_xy.interaction_mode = InteractiveMarkerControl.MOVE_PLANE
+        move_xy.always_visible = True
+
+        box = Marker()
+        box.type = Marker.CUBE
+        box.scale.x = 2.0
+        box.scale.y = 2.0
+        box.scale.z = 0.1
+        box.color.r = 0.2
+        box.color.g = 0.6
+        box.color.b = 1.0
+        box.color.a = 0.5
+
+        move_xy.markers.append(box)
+        im.controls.append(move_xy)
+
+        # =====================================================
+        # 2. EXTRA DIRECTION (X-axis only fine adjustment)
+        # =====================================================
+        move_x = InteractiveMarkerControl()
+        move_x.name = "move_x"
+        move_x.interaction_mode = InteractiveMarkerControl.MOVE_AXIS
+
+        # X axis direction (IMPORTANT: orientation defines axis)
+        move_x.orientation.w = 1.0
+        move_x.orientation.x = 1.0
+        move_x.orientation.y = 0.0
+        move_x.orientation.z = 0.0
+
+        im.controls.append(move_x)
+
+        # =====================================================
+        # 3. Z MOVE (keep if you still want height control)
+        # =====================================================
+        move_z = InteractiveMarkerControl()
+        move_z.name = "move_z"
+        move_z.interaction_mode = InteractiveMarkerControl.MOVE_AXIS
+        move_z.orientation.w = 1.0
+        move_z.orientation.x = 0.0
+        move_z.orientation.y = 0.0
+        move_z.orientation.z = 1.0
+
+        im.controls.append(move_z)
+
+        # =====================================================
+        # 4. YAW ROTATION
+        # =====================================================
+        rotate_y = InteractiveMarkerControl()
+        rotate_y.name = "rotate_y"
+        rotate_y.interaction_mode = InteractiveMarkerControl.ROTATE_AXIS
+
+        # Y axis (IMPORTANT CHANGE)
+        rotate_y.orientation.w = 1.0
+        rotate_y.orientation.x = 0.0
+        rotate_y.orientation.y = 1.0
+        rotate_y.orientation.z = 0.0
+
+        im.controls.append(rotate_y)
+
+        # Register
+        self.server.insert(im)
+        self.server.setCallback(im.name, self.process_feedback)
+
+    # =========================================================
+    # Marker Callback
+    # =========================================================
+    def process_feedback(self, feedback):
+        p = feedback.pose.position
+        q = feedback.pose.orientation
+
+        self.delta_x = p.x
+        self.delta_y = p.y
+        self.delta_z = p.z
+
+        r = R.from_quat([q.x, q.y, q.z, q.w])
+        euler = r.as_euler('xyz')
+
+        self.flip = np.degrees(euler[0])
+        self.yaw_angle = np.degrees(euler[2])
+
+    # =========================================================
+    # Main loop
+    # =========================================================
     def loop(self):
-        k = cv2.waitKey(1)
+        cv2.waitKey(1)
 
-        # ESC to exit and save
-        if k == 27:
-            config = [
-                {"x": self.delta_x},
-                {"y": self.delta_y},
-                {"z": self.delta_z},
-                {"yaw": self.yaw_angle},
-                {"flip": self.flip}
-            ]
-            write_config(config, "config/transform.yaml")
-            cv2.destroyAllWindows()
-            rclpy.shutdown()
-            return
-
-        # Step size
-        if k == ord('o'):
-            self.step_meters += 0.1
-        if k == ord('l'):
-            self.step_meters -= 0.1
-
-        # Rotation
-        if k == ord('q'):
-            self.yaw_angle -= self.step_degrees
-        if k == ord('e'):
-            self.yaw_angle += self.step_degrees
-
-        # Translation
-        if k == ord('s'):
-            self.delta_y -= self.step_meters
-        if k == ord('w'):
-            self.delta_y += self.step_meters
-        if k == ord('a'):
-            self.delta_x += self.step_meters
-        if k == ord('d'):
-            self.delta_x -= self.step_meters
-
-        # Z
-        if k == ord('f'):
-            self.delta_z -= 0.1
-        if k == ord('r'):
-            self.delta_z += 0.1
-
-        # Flip
-        if k == ord('x'):
-            self.flip = 180 if self.flip == 0 else 0
-
-        # Pose
+        # Pose from state
         pose = gtsam.Pose2(
             self.delta_x,
             self.delta_y,
             np.radians(self.yaw_angle)
         )
 
-        # TF message
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = "map"
         t.child_frame_id = "sat_frame"
 
-        t.transform.translation.x = pose.x()
-        t.transform.translation.y = pose.y()
+        t.transform.translation.x = self.delta_x
+        t.transform.translation.y = self.delta_y
         t.transform.translation.z = self.delta_z
 
-        # Quaternion using scipy
-        roll = np.radians(self.flip)
-        pitch = 0.0
-        yaw = pose.theta()
-
-        q = R.from_euler('xyz', [roll, pitch, yaw]).as_quat()
+        q = R.from_euler(
+            'xyz',
+            [np.radians(self.flip), 0.0, pose.theta()]
+        ).as_quat()
 
         t.transform.rotation.x = q[0]
         t.transform.rotation.y = q[1]
@@ -179,6 +257,9 @@ class SatImageCloudNode(Node):
         self.pub.publish(self.pc2)
 
 
+# =========================================================
+# Main
+# =========================================================
 def main(args=None):
     rclpy.init(args=args)
     node = SatImageCloudNode()
