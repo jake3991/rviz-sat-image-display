@@ -44,7 +44,7 @@ class SatImageCloudNode(Node):
 
         # Image
         self.sat_img = cv2.imread("images/" + self.config.get("image"))
-        cv2.imshow("test", np.zeros((100, 100)))
+        # cv2.imshow("test", np.zeros((100, 100)))
 
         # -----------------------------
         # Initial state
@@ -87,7 +87,8 @@ class SatImageCloudNode(Node):
 
         for i in range(self.sat_img.shape[0]):
             for j in range(self.sat_img.shape[1]):
-                r, g, b = self.sat_img[i][j]
+                # r, g, b = self.sat_img[i][j]
+                b, g, r = self.sat_img[i][j]
                 rgb = struct.unpack('I', struct.pack('BBBB', b, g, r, 255))[0]
 
                 points.append([
@@ -215,8 +216,17 @@ class SatImageCloudNode(Node):
         r = R.from_quat([q.x, q.y, q.z, q.w])
         euler = r.as_euler('xyz')
 
-        self.flip = np.degrees(euler[0])
+        # self.flip = np.degrees(euler[0])
         self.yaw_angle = np.degrees(euler[2])
+
+        config = [
+                {"x": self.delta_x},
+                {"y": self.delta_y},
+                {"z": self.delta_z},
+                {"yaw": float(self.yaw_angle)},
+                {"flip": self.flip}
+            ]
+        write_config(config, "config/transform.yaml")
 
     # =========================================================
     # Main loop
